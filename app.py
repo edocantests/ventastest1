@@ -1,134 +1,110 @@
+# app.py
 import streamlit as st
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
-from io import BytesIO
+import re
+import json
+from youtube_transcript_api import YouTubeTranscriptApi
+import openai
+from urllib.parse import urlparse, parse_qs
 
-st.set_page_config(
-    page_title="Formato Condicional de Ventas",
-    page_icon="📊",
-    layout="centered"
-)
+st.set_page_config(page_title="YouTube -> Teachings JSON", layout="centered")
 
-st.title("📊 Formato Condicional para Ventas")
-st.markdown("""
-Esta aplicación aplica formato condicional a tu archivo Excel:
-- 🟢 **Verde**: Los 5 valores más altos de ventas
-- 🔴 **Rojo**: Los 5 valores más bajos de ventas
-""")
+st.title("Extraer enseñanzas de YouTube → JSON")
+st.markdown("Pega enlaces de YouTube (uno por línea), ajusta el prompt si quieres, y pulsa `Procesar`.")
 
-st.divider()
+# Input
+urls_text = st.text_area("Enlaces de YouTube (uno por línea)", height=150)
+prompt_custom = st.text_area("Prompt para el modelo (déjalo si quieres usar el predeterminado)", height=140, value=(
+    "Eres un experto educativo. Lee esta transcripción de un video y extrae las *enseñanzas* "
+    "o lecciones prácticas. Para cada enseñanza devuelve: id, resumen corto (español), "
+    "explicación más larga, timestamps sugeridos (si hay), citas textuales relevantes (si las hay), "
+    "y un campo 'importancia' del 1 al 5. Responde **solo** con JSON que cumpla el schema indicado."
+))
+model_choice = st.selectbox("Proveedor de LLM", ["openai (API key requerida)","(por defecto) openai"])
+api_key = st.text_input("Tu API key (será guardada como secreto en Streamlit mientras la app corre)", type="password")
 
-uploaded_file = st.file_uploader(
-    "Sube tu archivo Excel",
-    type=['xlsx', 'xls'],
-    help="El archivo debe contener una columna llamada 'ventas'"
-)
+process = st.button("Procesar enlaces")
 
-if uploaded_file is not None:
+# Helper: get video id
+def extract_video_id(url):
+    # works for youtu.be and youtube.com/watch?v=
     try:
-        df = pd.read_excel(uploaded_file)
-        
-        if 'ventas' not in df.columns:
-            st.error("❌ El archivo no contiene una columna llamada 'ventas'")
-            st.info("Columnas disponibles: " + ", ".join(df.columns))
-        else:
-            st.success("✅ Archivo cargado correctamente")
-            st.subheader("Vista previa de los datos")
-            st.dataframe(df, use_container_width=True)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total de filas", len(df))
-            with col2:
-                st.metric("Venta máxima", f"${df['ventas'].max():,.2f}")
-            with col3:
-                st.metric("Venta mínima", f"${df['ventas'].min():,.2f}")
-            
-            st.divider()
-            
-            if st.button("🎨 Aplicar Formato Condicional", type="primary", use_container_width=True):
-                with st.spinner("Aplicando formato condicional..."):
-                    output = BytesIO()
-                    
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    
-                    output.seek(0)
-                    wb = load_workbook(output)
-                    ws = wb.active
-                    
-                    headers = [cell.value for cell in ws[1]]
-                    ventas_col_idx = headers.index('ventas') + 1
-                    
-                    ventas_values = df['ventas'].dropna()
-                    
-                    top_5 = ventas_values.nlargest(5).values
-                    bottom_5 = ventas_values.nsmallest(5).values
-                    
-                    green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-                    red_fill = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")
-                    
-                    for row in range(2, ws.max_row + 1):
-                        cell = ws.cell(row=row, column=ventas_col_idx)
-                        cell_value = cell.value
-                        
-                        if cell_value is not None:
-                            if cell_value in top_5:
-                                cell.fill = green_fill
-                            elif cell_value in bottom_5:
-                                cell.fill = red_fill
-                    
-                    output_final = BytesIO()
-                    wb.save(output_final)
-                    output_final.seek(0)
-                    
-                    st.success("✅ Formato aplicado correctamente")
-                    
-                    st.subheader("📈 Resumen del formato aplicado")
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown("**🟢 Top 5 Ventas (Verde)**")
-                        for i, val in enumerate(sorted(top_5, reverse=True), 1):
-                            st.write(f"{i}. ${val:,.2f}")
-                    
-                    with col2:
-                        st.markdown("**🔴 Bottom 5 Ventas (Rojo)**")
-                        for i, val in enumerate(sorted(bottom_5), 1):
-                            st.write(f"{i}. ${val:,.2f}")
-                    
-                    st.divider()
-                    
-                    st.download_button(
-                        label="⬇️ Descargar archivo con formato",
-                        data=output_final,
-                        file_name="ventas_formato_condicional.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-    
+        parsed = urlparse(url.strip())
+        if parsed.hostname in ["youtu.be"]:
+            return parsed.path.lstrip('/')
+        if 'youtube' in parsed.hostname:
+            qs = parse_qs(parsed.query)
+            return qs.get('v', [None])[0]
+    except Exception:
+        return None
+    return None
+
+# get transcript
+def fetch_transcript(video_id):
+    try:
+        data = YouTubeTranscriptApi.get_transcript(video_id, languages=['es','en'])
+        # data is list of {'text':..., 'start':..., 'duration':...}
+        full_text = " ".join(seg['text'] for seg in data)
+        return full_text, data
     except Exception as e:
-        st.error(f"❌ Error al procesar el archivo: {str(e)}")
-        st.info("Por favor, verifica que el archivo sea un Excel válido.")
+        return None, str(e)
 
-else:
-    st.info("👆 Sube un archivo Excel para comenzar")
-    
-    with st.expander("ℹ️ Requisitos del archivo"):
-        st.markdown("""
-        - El archivo debe ser formato Excel (.xlsx o .xls)
-        - Debe contener una columna llamada exactamente **'ventas'**
-        - Los valores de ventas deben ser numéricos
-        - Se recomienda tener al menos 10 filas de datos
-        """)
-    
-    with st.expander("📝 Ejemplo de estructura"):
-        ejemplo_df = pd.DataFrame({
-            'producto': ['A', 'B', 'C', 'D', 'E'],
-            'ventas': [1000, 2500, 800, 3200, 1500]
-        })
-        st.dataframe(ejemplo_df, use_container_width=True)
+# Build schema for each video
+def build_prompt_for_transcript(transcript, url):
+    return f"{prompt_custom}\n\nURL: {url}\n\nTRANSCRIPCIÓN:\n{transcript}\n\nDevuelve JSON válido."
 
-st.divider()
-st.caption("Desarrollado con Streamlit 🎈")
+# Call OpenAI
+def call_openai(api_key, prompt, model="gpt-4o-mini"):
+    import openai as _openai
+    _openai.api_key = api_key
+    messages = [
+        {"role":"system","content":"Eres un asistente que extrae enseñanzas y devuelve JSON estricto."},
+        {"role":"user","content": prompt}
+    ]
+    resp = _openai.ChatCompletion.create(model=model, messages=messages, temperature=0.1, max_tokens=1500)
+    text = resp['choices'][0]['message']['content']
+    return text
+
+if process:
+    if not urls_text.strip():
+        st.error("Pega al menos un enlace.")
+    elif "openai" in model_choice and not api_key:
+        st.error("Para usar OpenAI necesitas pegar tu API key.")
+    else:
+        urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        results = []
+        st.info(f"Procesando {len(urls)} enlaces...")
+        for i, url in enumerate(urls, start=1):
+            st.write(f"({i}/{len(urls)}) {url}")
+            vid = extract_video_id(url)
+            if not vid:
+                st.warning(f"No se pudo extraer ID del enlace: {url}")
+                continue
+            transcript, meta = fetch_transcript(vid)
+            if not transcript:
+                st.warning(f"No hay transcripción automática disponible para {vid}. Error: {meta}")
+                # aquí podríamos añadir fallback (ej. servicio STT), pero lo dejamos para version 2
+                continue
+            prompt = build_prompt_for_transcript(transcript, url)
+            try:
+                ai_out = call_openai(api_key, prompt)
+                # Intentamos parsear JSON que el modelo debería devolver
+                try:
+                    parsed = json.loads(ai_out)
+                except Exception:
+                    # Si el modelo devolvió texto extra, intentamos extraer el JSON
+                    m = re.search(r"(\{.*\}|\[.*\])", ai_out, re.DOTALL)
+                    if m:
+                        parsed = json.loads(m.group(1))
+                    else:
+                        parsed = {"error_parsing": ai_out}
+                results.append({
+                    "video_id": vid,
+                    "url": url,
+                    "extracted": parsed
+                })
+            except Exception as e:
+                st.error(f"Error llamando al LLM: {e}")
+        # show and download
+        final_json = {"generated_at": st.secrets.get("generated_at", ""), "results": results}
+        st.json(final_json)
+        st.download_button("Descargar JSON", json.dumps(final_json, ensure_ascii=False, indent=2), file_name="teachings.json", mime="application/json")
